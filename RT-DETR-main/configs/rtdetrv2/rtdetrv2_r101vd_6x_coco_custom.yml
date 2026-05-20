@@ -1,0 +1,45 @@
+_pymodule: model       # ✅ 必须加这一行！
+
+__include__: [
+  '../dataset/custom_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+batch_size: 4
+total_batch_size: 4
+
+output_dir: ./output/rtdetrv2_r101vd_6x_custom_dataset
+
+PResNet:
+  depth: 101
+  pretrained: False
+
+HybridEncoder:
+  hidden_dim: 384
+  dim_feedforward: 2048
+
+RTDETRTransformerv2:
+  feat_channels: [384, 384, 384]
+  num_classes: 2
+
+optimizer:
+  type: AdamW
+  params:
+    - params: '^(?=.*backbone)(?!.*norm|bn).*$'
+      lr: 0.00001
+    - params: '^(?=.*(?:encoder|decoder))(?=.*norm|bn).*$'
+      weight_decay: 0.0
+  lr: 0.0001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+train:
+  epochs: 180
+  val_interval: 5
+  resume: False
+
+dataset:
+  class_names: ['1', '2']
