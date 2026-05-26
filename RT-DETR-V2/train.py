@@ -62,8 +62,7 @@ if __name__ == '__main__':
     # 可选参数：断点续训，从指定检查点恢复训练
     parser.add_argument('-r', '--resume', type=str, help='断点续训：从指定的模型检查点恢复训练')
     # 可选参数：模型微调，从指定预训练权重开始微调
-    parser.add_argument('-t', '--tuning', type=str, help='模型微调：从指定预训练权重开始微调')
-    # 可选参数：指定运行设备（cpu/cuda/cuda:0等）
+    parser.add_argument('-t', '--tuning', type=str, help='模型微调：从指定预训练权重开始微调')    # 可选参数：指定运行设备（cpu/cuda/cuda:0等）
     parser.add_argument('-d', '--device', type=str, help='指定运行设备，如cuda、cpu、cuda:0')
     # 可选参数：随机种子，保证实验可复现
     parser.add_argument('--seed', type=int, help='随机种子，保证实验结果可复现')

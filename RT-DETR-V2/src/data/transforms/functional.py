@@ -5,8 +5,9 @@ from packaging import version
 from typing import Optional, List
 from torch import Tensor
 
-# needed due to empty tensor bug in pytorch and torchvision 0.5
+# 处理低版本 torchvision 空张量的 bug
 import torchvision
+
 if version.parse(torchvision.__version__) < version.parse('0.7'):
     from torchvision.ops import _new_empty_tensor
     from torchvision.ops.misc import _output_size
@@ -15,10 +16,11 @@ if version.parse(torchvision.__version__) < version.parse('0.7'):
 def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corners=None):
     # type: (Tensor, Optional[List[int]], Optional[float], str, Optional[bool]) -> Tensor
     """
-    Equivalent to nn.functional.interpolate, but with support for empty batch sizes.
-    This will eventually be supported natively by PyTorch, and this
-    class can go away.
+    兼容版上采样/下采样函数
+    等价于 nn.functional.interpolate，但兼容空张量（解决低版本 torchvision 报错）
+    未来 PyTorch 原生支持后可删除
     """
+    # 低版本 torchvision 单独处理空张量
     if version.parse(torchvision.__version__) < version.parse('0.7'):
         if input.numel() > 0:
             return torch.nn.functional.interpolate(
@@ -32,44 +34,58 @@ def interpolate(input, size=None, scale_factor=None, mode="nearest", align_corne
         return torchvision.ops.misc.interpolate(input, size, scale_factor, mode, align_corners)
 
 
-
 def crop(image, target, region):
+    """
+    对图像和标注（框、掩码、标签）同步执行裁剪
+    Args:
+        image: 输入图像
+        target: 标注字典（boxes、labels、masks等）
+        region: 裁剪区域 (i, j, h, w) → 起始行、起始列、高度、宽度
+    Return:
+        裁剪后的图像 + 更新后的标注
+    """
+    # 裁剪图像
     cropped_image = F.crop(image, *region)
 
     target = target.copy()
     i, j, h, w = region
 
-    # should we do something wrt the original size?
+    # 更新目标尺寸
     target["size"] = torch.tensor([h, w])
 
+    # 需要保留的标注字段
     fields = ["labels", "area", "iscrowd"]
 
+    # 如果有框，更新框坐标
     if "boxes" in target:
         boxes = target["boxes"]
         max_size = torch.as_tensor([w, h], dtype=torch.float32)
+        # 减去裁剪偏移量
         cropped_boxes = boxes - torch.as_tensor([j, i, j, i])
+        # 限制在裁剪区域内
         cropped_boxes = torch.min(cropped_boxes.reshape(-1, 2, 2), max_size)
         cropped_boxes = cropped_boxes.clamp(min=0)
+        # 重新计算面积
         area = (cropped_boxes[:, 1, :] - cropped_boxes[:, 0, :]).prod(dim=1)
         target["boxes"] = cropped_boxes.reshape(-1, 4)
         target["area"] = area
         fields.append("boxes")
 
+    # 如果有掩码，裁剪掩码
     if "masks" in target:
-        # FIXME should we update the area here if there are no boxes?
         target['masks'] = target['masks'][:, i:i + h, j:j + w]
         fields.append("masks")
 
-    # remove elements for which the boxes or masks that have zero area
+    # 移除面积为0的无效目标
     if "boxes" in target or "masks" in target:
-        # favor boxes selection when defining which elements to keep
-        # this is compatible with previous implementation
+        # 优先用框判断有效性
         if "boxes" in target:
             cropped_boxes = target['boxes'].reshape(-1, 2, 2)
             keep = torch.all(cropped_boxes[:, 1, :] > cropped_boxes[:, 0, :], dim=1)
         else:
             keep = target['masks'].flatten(1).any(1)
 
+        # 过滤所有标注字段
         for field in fields:
             target[field] = target[field][keep]
 
@@ -77,16 +93,22 @@ def crop(image, target, region):
 
 
 def hflip(image, target):
+    """
+    图像 + 标注 同步水平翻转
+    自动修正框坐标、翻转掩码
+    """
     flipped_image = F.hflip(image)
 
     w, h = image.size
 
     target = target.copy()
+    # 翻转框坐标
     if "boxes" in target:
         boxes = target["boxes"]
         boxes = boxes[:, [2, 1, 0, 3]] * torch.as_tensor([-1, 1, -1, 1]) + torch.as_tensor([w, 0, w, 0])
         target["boxes"] = boxes
 
+    # 水平翻转掩码
     if "masks" in target:
         target['masks'] = target['masks'].flip(-1)
 
@@ -94,8 +116,15 @@ def hflip(image, target):
 
 
 def resize(image, target, size, max_size=None):
-    # size can be min_size (scalar) or (w, h) tuple
+    """
+    图像 + 标注 同步缩放
+    自动保持宽高比、缩放框、缩放掩码
+    Args:
+        size: 目标最短边 / (w, h)
+        max_size: 最长边上限
+    """
 
+    # 根据宽高比计算新尺寸
     def get_size_with_aspect_ratio(image_size, size, max_size=None):
         w, h = image_size
         if max_size is not None:
@@ -113,10 +142,6 @@ def resize(image, target, size, max_size=None):
         else:
             oh = size
             ow = int(size * w / h)
-            
-        # r = min(size / min(h, w), max_size / max(h, w))
-        # ow = int(w * r)
-        # oh = int(h * r)
 
         return (oh, ow)
 
@@ -126,21 +151,25 @@ def resize(image, target, size, max_size=None):
         else:
             return get_size_with_aspect_ratio(image_size, size, max_size)
 
+    # 计算最终输出尺寸
     size = get_size(image.size, size, max_size)
     rescaled_image = F.resize(image, size)
 
     if target is None:
         return rescaled_image, None
 
+    # 计算宽高缩放比例
     ratios = tuple(float(s) / float(s_orig) for s, s_orig in zip(rescaled_image.size, image.size))
     ratio_width, ratio_height = ratios
 
     target = target.copy()
+    # 缩放框
     if "boxes" in target:
         boxes = target["boxes"]
         scaled_boxes = boxes * torch.as_tensor([ratio_width, ratio_height, ratio_width, ratio_height])
         target["boxes"] = scaled_boxes
 
+    # 缩放面积
     if "area" in target:
         area = target["area"]
         scaled_area = area * (ratio_width * ratio_height)
@@ -149,6 +178,7 @@ def resize(image, target, size, max_size=None):
     h, w = size
     target["size"] = torch.tensor([h, w])
 
+    # 缩放掩码
     if "masks" in target:
         target['masks'] = interpolate(
             target['masks'][:, None].float(), size, mode="nearest")[:, 0] > 0.5
@@ -157,13 +187,20 @@ def resize(image, target, size, max_size=None):
 
 
 def pad(image, target, padding):
-    # assumes that we only pad on the bottom right corners
+    """
+    图像 + 标注 向右、向下填充
+    只在右侧和下侧 padding，常用于统一到网络输入尺寸
+    """
+    # 只在右下角填充 (左, 上, 右, 下)
     padded_image = F.pad(image, (0, 0, padding[0], padding[1]))
     if target is None:
         return padded_image, None
+
     target = target.copy()
-    # should we do something wrt the original size?
     target["size"] = torch.tensor(padded_image.size[::-1])
+
+    # 掩码同步填充
     if "masks" in target:
         target['masks'] = torch.nn.functional.pad(target['masks'], (0, padding[0], 0, padding[1]))
+
     return padded_image, target

@@ -27,19 +27,19 @@ from ..data import DataLoader
 
 def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=None, ):
     """
-    env setup
+    初始化分布式训练环境
     args:
-        print_rank, 
-        print_method, (builtin, rich)
-        seed, 
+        print_rank: 哪个 rank 负责打印
+        print_method: 打印方式
+        seed: 随机种子
     """
     try:
-        # https://pytorch.org/docs/stable/elastic/run.html
+        # 从环境变量获取分布式参数
         RANK = int(os.getenv('RANK', -1))
-        LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  
+        LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))
         WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
-        
-        # torch.distributed.init_process_group(backend=backend, init_method='env://')
+
+        # 初始化进程组
         torch.distributed.init_process_group(init_method='env://')
         torch.distributed.barrier()
 
@@ -50,10 +50,14 @@ def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=
         print('Initialized distributed mode...')
 
     except:
+        # 无法初始化则使用单机模式
         enabled_dist = False
         print('Not init distributed mode.')
 
+    # 设置只让主进程打印
     setup_print(get_rank() == print_rank, method=print_method)
+
+    # 设置随机种子
     if seed is not None:
         setup_seed(seed)
 
@@ -61,7 +65,8 @@ def setup_distributed(print_rank: int=0, print_method: str='builtin', seed: int=
 
 
 def setup_print(is_main, method='builtin'):
-    """This function disables printing when not in master process
+    """
+    只让主进程打印，其他进程禁止打印
     """
     import builtins as __builtin__
 
@@ -69,7 +74,7 @@ def setup_print(is_main, method='builtin'):
         builtin_print = __builtin__.print
 
     elif method == 'rich':
-        import rich 
+        import rich
         builtin_print = rich.print
 
     else:
@@ -84,6 +89,9 @@ def setup_print(is_main, method='builtin'):
 
 
 def is_dist_available_and_initialized():
+    """
+    判断分布式环境是否可用且已初始化
+    """
     if not torch.distributed.is_available():
         return False
     if not torch.distributed.is_initialized():
@@ -93,7 +101,8 @@ def is_dist_available_and_initialized():
 
 @atexit.register
 def cleanup():
-    """cleanup distributed environment
+    """
+    程序退出时自动销毁进程组
     """
     if is_dist_available_and_initialized():
         torch.distributed.barrier()
@@ -101,89 +110,119 @@ def cleanup():
 
 
 def get_rank():
+    """
+    获取当前进程 rank
+    """
     if not is_dist_available_and_initialized():
         return 0
     return torch.distributed.get_rank()
 
 
 def get_world_size():
+    """
+    获取全局进程数
+    """
     if not is_dist_available_and_initialized():
         return 1
     return torch.distributed.get_world_size()
 
-    
+
 def is_main_process():
+    """
+    判断是否是主进程
+    """
     return get_rank() == 0
 
 
 def save_on_master(*args, **kwargs):
+    """
+    只在主进程保存模型，避免重复保存
+    """
     if is_main_process():
         torch.save(*args, **kwargs)
 
 
-
 def warp_model(
-    model: torch.nn.Module, 
-    sync_bn: bool=False, 
-    dist_mode: str='ddp', 
-    find_unused_parameters: bool=False, 
-    compile: bool=False, 
-    compile_mode: str='reduce-overhead', 
+    model: torch.nn.Module,
+    sync_bn: bool=False,
+    dist_mode: str='ddp',
+    find_unused_parameters: bool=False,
+    compile: bool=False,
+    compile_mode: str='reduce-overhead',
     **kwargs
 ):
+    """
+    包装模型：支持 DDP/DP、SyncBN、torch.compile
+    """
     if is_dist_available_and_initialized():
         rank = get_rank()
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if sync_bn else model 
+
+        # 开启同步 BN
+        model = nn.SyncBatchNorm.convert_sync_batchnorm(model) if sync_bn else model
+
         if dist_mode == 'dp':
             model = DP(model, device_ids=[rank], output_device=rank)
+
         elif dist_mode == 'ddp':
             model = DDP(model, device_ids=[rank], output_device=rank, find_unused_parameters=find_unused_parameters)
+
         else:
             raise AttributeError('')
 
+    # 模型编译加速
     if compile:
         model = torch.compile(model, mode=compile_mode)
 
     return model
 
+
 def de_model(model):
+    """
+    解包模型：去掉 DDP/DP/Compile 包装，拿到原始模型
+    """
     return de_parallel(de_complie(model))
 
 
-def warp_loader(loader, shuffle=False):        
+def warp_loader(loader, shuffle=False):
+    """
+    包装 DataLoader：分布式环境自动添加 DistributedSampler
+    """
     if is_dist_available_and_initialized():
         sampler = DistributedSampler(loader.dataset, shuffle=shuffle)
-        loader = DataLoader(loader.dataset, 
-                            loader.batch_size, 
-                            sampler=sampler, 
-                            drop_last=loader.drop_last, 
-                            collate_fn=loader.collate_fn, 
-                            pin_memory=loader.pin_memory,
-                            num_workers=loader.num_workers, )
+        loader = DataLoader(
+            loader.dataset,
+            loader.batch_size,
+            sampler=sampler,
+            drop_last=loader.drop_last,
+            collate_fn=loader.collate_fn,
+            pin_memory=loader.pin_memory,
+            num_workers=loader.num_workers,
+        )
     return loader
 
 
-
 def is_parallel(model) -> bool:
-    # Returns True if model is of type DP or DDP
+    """
+    判断模型是否是 DP/DDP 包装
+    """
     return type(model) in (torch.nn.parallel.DataParallel, torch.nn.parallel.DistributedDataParallel)
 
 
 def de_parallel(model) -> nn.Module:
-    # De-parallelize a model: returns single-GPU model if model is of type DP or DDP
+    """
+    去掉 DP/DDP 包装
+    """
     return model.module if is_parallel(model) else model
 
 
 def reduce_dict(data, avg=True):
     """
-    Args 
-        data dict: input, {k: v, ...}
-        avg bool: true
+    分布式多卡之间聚合字典数据（loss 等指标）
     """
     world_size = get_world_size()
     if world_size < 2:
         return data
-    
+
     with torch.no_grad():
         keys, values = [], []
         for k in sorted(data.keys()):
@@ -195,17 +234,13 @@ def reduce_dict(data, avg=True):
 
         if avg is True:
             values /= world_size
-        
+
         return {k: v for k, v in zip(keys, values)}
-        
+
 
 def all_gather(data):
     """
-    Run all_gather on arbitrary picklable data (not necessarily tensors)
-    Args:
-        data: any picklable object
-    Returns:
-        list[data]: list of data gathered from each rank
+    所有进程收集数据（用于评估）
     """
     world_size = get_world_size()
     if world_size == 1:
@@ -214,10 +249,11 @@ def all_gather(data):
     torch.distributed.all_gather_object(data_list, data)
     return data_list
 
-    
-import time 
+
+import time
 def sync_time():
-    """sync_time
+    """
+    同步 GPU 时间，保证计时准确
     """
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -225,26 +261,27 @@ def sync_time():
     return time.time()
 
 
-
 def setup_seed(seed: int, deterministic=False):
-    """setup_seed for reproducibility
-    torch.manual_seed(3407) is all you need. https://arxiv.org/abs/2109.08203
+    """
+    设置全局随机种子，保证可复现
     """
     seed = seed + get_rank()
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    
+
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-    # memory will be large when setting deterministic to True
     if torch.backends.cudnn.is_available() and deterministic:
         torch.backends.cudnn.deterministic = True
 
 
 # for torch.compile
 def check_compile():
+    """
+    检查 GPU 是否支持 torch.compile
+    """
     import torch
     import warnings
     gpu_ok = False
@@ -259,9 +296,13 @@ def check_compile():
         )
     return gpu_ok
 
+
 def is_compile(model):
+    """判断模型是否被 compile 包装"""
     import torch._dynamo
     return type(model) in (torch._dynamo.OptimizedModule, )
 
+
 def de_complie(model):
+    """去掉 compile 包装"""
     return model._orig_mod if is_compile(model) else model
